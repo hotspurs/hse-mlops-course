@@ -1,3 +1,4 @@
 # Введение в MLOps
 ФИО - Дубов Владислав Владимирович
-Tg - dubov_vv
+
+Telegram - dubov_vv
