@@ -1,9 +1,13 @@
 import io
+import os
 import numpy as np
 import pandas as pd
 import pickle
 import json
+import logging
 
+import mlflow
+from mlflow.models import infer_signature
 from airflow.models import DAG, Variable
 from airflow.operators.python_operator import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -13,12 +17,22 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.datasets import fetch_california_housing
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, median_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from typing import Any, Dict, Literal
 from datetime import timedelta
 import time
-import logging
+
+def configure_mlflow():
+    for key in [
+        "MLFLOW_TRACKING_URI",
+        "AWS_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_DEFAULT_REGION",
+    ]:
+        os.environ[key] = Variable.get(key)
+
+MLFLOW_EXPERIMENT_NAME = 'vladislav_dubov'
 
 BUCKET = Variable.get("S3_BUCKET")
 DEFAULT_ARGS = {
@@ -51,12 +65,29 @@ models = dict(
 _LOG = logging.getLogger()
 _LOG.addHandler(logging.StreamHandler())
 
-def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression", "desicion_tree"]):
-    def init(m_name: Literal["random_forest", "linear_regression", "desicion_tree"], owner: str) -> Dict[str, Any]:
+def check_experiment_exists(name):
+    return mlflow.search_experiments(
+        filter_string=f"name = '{MLFLOW_EXPERIMENT_NAME}'"
+    )
+
+def create_dag(dag_id: str):
+    def init(owner: str) -> Dict[str, Any]:
         _LOG.info("Init")
+
+        if not check_experiment_exists(MLFLOW_EXPERIMENT_NAME):
+            mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME)
+
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+        run_id = ''
+
+        with mlflow.start_run(run_name="dubov_vv") as parent_run:
+            run_id = parent_run.info.run_id
+
         return {
             "init_timestamp_start": time.time(),
-            "model_name": m_name
+            "run_id": run_id,
+            "experiment_id": mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME).experiment_id
         }
 
     def get_data(**kwargs) -> Dict[str, Any]:
@@ -66,7 +97,6 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
         metrics["get_data_timestamp_start"] = time.time()
         owner = kwargs["owner"]
         owner_path = ''.join(owner.split(' '))
-        m_name = kwargs["m_name"]
         housing = fetch_california_housing(as_frame=True)
         data = pd.concat([housing["data"], pd.DataFrame(housing["target"])], axis=1)
 
@@ -77,7 +107,7 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
 
         s3_hook.load_file_obj(
             file_obj=filebuffer,
-            key=f"{owner_path}/{m_name}/datasets/california_housing.pkl",
+            key=f"{owner_path}/datasets/california_housing.pkl",
             bucket_name=BUCKET,
             replace=True,
         )
@@ -92,8 +122,7 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
         s3_hook = S3Hook("s3_connection")
         owner = kwargs["owner"]
         owner_path = ''.join(owner.split(' '))
-        m_name = kwargs["m_name"]
-        file = s3_hook.download_file(key=f"{owner_path}/{m_name}/datasets/california_housing.pkl", bucket_name=BUCKET)
+        file = s3_hook.download_file(key=f"{owner_path}/datasets/california_housing.pkl", bucket_name=BUCKET)
         data = pd.read_pickle(file)
 
         X, y = data[FEATURES], data[TARGET]
@@ -115,7 +144,7 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
             filebuffer.seek(0)
             s3_hook.load_file_obj(
                 file_obj=filebuffer,
-                key=f"{owner_path}/{m_name}/datasets/{name}.pkl",
+                key=f"{owner_path}/datasets/{name}.pkl",
                 bucket_name=BUCKET,
                 replace=True,
             )
@@ -125,43 +154,56 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
 
     def train_model(**kwargs) -> Dict[str, Any]:
         ti = kwargs["ti"]
-        metrics = ti.xcom_pull(task_ids="prepare_data")
-        metrics["train_model_timestamp_start"] = time.time()
-        owner = kwargs["owner"]
         m_name = kwargs["m_name"]
-        owner_path = ''.join(owner.split(' '))
-        s3_hook = S3Hook("s3_connection")
-        data = {}
-        for name in ["X_train", "X_test", "y_train", "y_test"]:
-            file = s3_hook.download_file(
-                key=f"{owner_path}/{m_name}/datasets/{name}.pkl",
-                bucket_name=BUCKET,
+        xcom_data = ti.xcom_pull(task_ids="init")
+        print('xcom_data', xcom_data)
+        with mlflow.start_run(run_name=m_name, parent_run_id=xcom_data['run_id'], experiment_id=xcom_data['experiment_id'], nested=True):
+            metrics = ti.xcom_pull(task_ids="prepare_data")
+            metrics[f"train_model_{m_name}_timestamp_start"] = time.time()
+            owner = kwargs["owner"]
+            owner_path = ''.join(owner.split(' '))
+            s3_hook = S3Hook("s3_connection")
+            data = {}
+            for name in ["X_train", "X_test", "y_train", "y_test"]:
+                file = s3_hook.download_file(
+                    key=f"{owner_path}/datasets/{name}.pkl",
+                    bucket_name=BUCKET,
+                )
+                data[name] = pd.read_pickle(file)
+
+            model = models[m_name]
+            model.fit(data["X_train"], data["y_train"])
+            prediction = model.predict(data["X_test"])
+
+            signature = infer_signature(data["X_test"], prediction)
+            model_info = mlflow.sklearn.log_model(model, m_name, signature=signature)
+            mlflow.evaluate(
+                model=model_info.model_uri,
+                data=data["X_test"].copy(),
+                targets=np.array(data["y_test"]),
+                model_type="regressor",
+                evaluators=["default"],
             )
-            data[name] = pd.read_pickle(file)
 
-        model = models[m_name]
-        model.fit(data["X_train"], data["y_train"])
-        prediction = model.predict(data["X_test"])
-
-        metrics["r2_score"] = r2_score(data["y_test"], prediction)
-        metrics["rmse"] = mean_squared_error(data["y_test"], prediction) ** 0.5
-        metrics["mae"] = median_absolute_error(data["y_test"], prediction)
-        metrics["train_model_timestamp_end"] = time.time()
-        return metrics
+            metrics[f"train_model_{m_name}_timestamp_end"] = time.time()
+            return metrics
 
     def save_results(**kwargs) -> None:
         s3_hook = S3Hook("s3_connection")
         ti = kwargs["ti"]
         owner = kwargs["owner"]
         owner_path = ''.join(owner.split(' '))
-        m_name = kwargs["m_name"]
-        metrics = ti.xcom_pull(task_ids="train_model")
+        metrics = {}
+
+        for model_name in models.keys():
+            metrics.update(ti.xcom_pull(task_ids=f"train_{model_name}"))
+
         filebuffer = io.BytesIO()
         filebuffer.write(json.dumps(metrics).encode())
         filebuffer.seek(0)
         s3_hook.load_file_obj(
             file_obj=filebuffer,
-            key=f"{owner_path}/{m_name}/results/data.json",
+            key=f"{owner_path}/results/data.json",
             bucket_name=BUCKET,
             replace=True,
         )
@@ -181,38 +223,42 @@ def create_dag(dag_id: str, m_name: Literal["random_forest", "linear_regression"
             task_id="init", 
             python_callable=init, 
             dag=dag, 
-            op_kwargs={'m_name': m_name, 'owner': DEFAULT_ARGS["owner"]}
+            op_kwargs={'owner': DEFAULT_ARGS["owner"]}
         )
 
         task_get_data = PythonOperator(
             task_id="get_data", 
             python_callable=get_data, 
             dag=dag, 
-            op_kwargs={'m_name': m_name, 'owner': DEFAULT_ARGS["owner"]}
+            op_kwargs={'owner': DEFAULT_ARGS["owner"]}
         )
 
         task_prepare_data = PythonOperator(
             task_id="prepare_data", 
             python_callable=prepare_data, 
             dag=dag, 
-            op_kwargs={'m_name': m_name, 'owner': DEFAULT_ARGS["owner"]}
+            op_kwargs={'owner': DEFAULT_ARGS["owner"]}
         )
 
-        task_train_model = PythonOperator(
-            task_id="train_model", 
-            python_callable=train_model, 
-            dag=dag, 
-            op_kwargs={'m_name': m_name, 'owner': DEFAULT_ARGS["owner"]}
-        )
+        trains_tasks = []
+
+        for model_name in models.keys():
+            task_train_model = PythonOperator(
+                task_id=f"train_{model_name}", 
+                python_callable=train_model, 
+                dag=dag, 
+                op_kwargs={'m_name': model_name, 'owner': DEFAULT_ARGS["owner"]}
+            )
+            trains_tasks.append(task_train_model)
 
         task_save_results = PythonOperator(
             task_id="save_results", 
             python_callable=save_results, 
             dag=dag,
-            op_kwargs={'m_name': m_name, 'owner': DEFAULT_ARGS["owner"]}
+            op_kwargs={'owner': DEFAULT_ARGS["owner"]}
         )
 
-        task_init >> task_get_data >> task_prepare_data >> task_train_model >> task_save_results
+        task_init >> task_get_data >> task_prepare_data >> trains_tasks >> task_save_results
 
-for model_name in models.keys():
-    create_dag(f"dubov_vladislav_{model_name}", model_name)
+configure_mlflow()
+create_dag("dubov_vladislav")

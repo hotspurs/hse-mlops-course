@@ -10,6 +10,7 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    MLFLOW_TRACKING_URI: http://mlflow-service:5000
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
@@ -144,8 +145,8 @@ services:
       MLFLOW_S3_ENDPOINT_URL: https://storage.yandexcloud.net
       # Здесь они нужны для доступа из UI
       AWS_ENDPOINT_URL: https://storage.yandexcloud.net
-      AWS_ACCESS_KEY_ID: 
-      AWS_SECRET_ACCESS_KEY: 
+      AWS_ACCESS_KEY_ID:
+      AWS_SECRET_ACCESS_KEY:
       AWS_DEFAULT_REGION: ru-central1
     command:
       - bash
@@ -153,7 +154,7 @@ services:
       - |
         pip install boto3 --quiet
         mlflow server --host 0.0.0.0 \
-            --default-artifact-root s3://dubov-mlflow-artifacts/mlflow --serve-artifacts
+            --default-artifact-root s3://vlvldubov-ml-ops/mlflow --serve-artifacts
     expose:
       - "5000"
     ports:
